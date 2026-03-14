@@ -24,14 +24,16 @@
 #include <pico/stdlib.h>
 
 
-I2S::I2S(PinMode direction) {
+I2S::I2S(PinMode direction, pin_size_t bclk, pin_size_t data, pin_size_t mclk, pin_size_t data_rx) {
     _running = false;
     _bps = 16;
     _writtenHalf = false;
-    _isOutput = direction == OUTPUT;
-    _pinBCLK = 26;
-    _pinDOUT = 28;
-    _pinMCLK = 25;
+    _isInput = direction == INPUT || direction == INPUT_PULLUP;
+    _isOutput = direction == OUTPUT || direction == INPUT_PULLUP;
+    _pinBCLK = bclk;
+    _pinDOUT = data;
+    _pinDIN = direction == INPUT ? data : data_rx;
+    _pinMCLK = mclk;
     _MCLKenabled = false;
 #ifdef PIN_I2S_BCLK
     _pinBCLK = PIN_I2S_BCLK;
@@ -44,13 +46,17 @@ I2S::I2S(PinMode direction) {
 #endif
 
 #ifdef PIN_I2S_DIN
-    if (!_isOutput) {
-        _pinDOUT = PIN_I2S_DIN;
+    if (_isInput) {
+        _pinDIN = PIN_I2S_DIN;
     }
 #endif
     _freq = 48000;
-    _arb = nullptr;
-    _cb = nullptr;
+    _arbInput = nullptr;
+    _cbInput = nullptr;
+    _cbdInput = nullptr;
+    _arbOutput = nullptr;
+    _cbOutput = nullptr;
+    _cbdOutput = nullptr;
     _buffers = 6;
     _bufferWords = 0;
     _silenceSample = 0;
@@ -59,6 +65,8 @@ I2S::I2S(PinMode direction) {
     _tdmChannels = 8;
     _swapClocks = false;
     _multMCLK = 256;
+    _isSlave = false;
+    _pgm = nullptr;
 }
 
 I2S::~I2S() {
@@ -80,11 +88,40 @@ bool I2S::setMCLK(pin_size_t pin) {
     _pinMCLK = pin;
     return true;
 }
+
+bool I2S::setSlave() {
+    if (_running) {
+        return false;
+    }
+    _isSlave = true;
+    return true;
+}
+
 bool I2S::setDATA(pin_size_t pin) {
+    if (_running || (pin >= __GPIOCNT) || (_isOutput && _isInput)) {
+        return false;
+    }
+    if (_isOutput) {
+        _pinDOUT = pin;
+    } else {
+        _pinDIN = pin;
+    }
+    return true;
+}
+
+bool I2S::setDOUT(pin_size_t pin) {
     if (_running || (pin >= __GPIOCNT)) {
         return false;
     }
     _pinDOUT = pin;
+    return true;
+}
+
+bool I2S::setDIN(pin_size_t pin) {
+    if (_running || (pin >= __GPIOCNT)) {
+        return false;
+    }
+    _pinDIN = pin;
     return true;
 }
 
@@ -109,12 +146,16 @@ bool I2S::setBuffers(size_t buffers, size_t bufferWords, int32_t silenceSample) 
 bool I2S::setFrequency(int newFreq) {
     _freq = newFreq;
     if (_running) {
-        if (_MCLKenabled) {
-            int bitClk = _freq * _bps * (_isTDM ? (double)_tdmChannels : 2.0) /* channels */ * 2.0 /* edges per clock */;
-            pio_sm_set_clkdiv_int_frac(_pio, _sm, clock_get_hz(clk_sys) / bitClk, 0);
+        if (_isSlave) {
+            pio_sm_set_clkdiv_int_frac(_pio, _sm, 1, 0);
         } else {
-            float bitClk = _freq * _bps * (_isTDM ? (double)_tdmChannels : 2.0) /* channels */ * 2.0 /* edges per clock */;
-            pio_sm_set_clkdiv(_pio, _sm, (float)clock_get_hz(clk_sys) / bitClk);
+            if (_MCLKenabled) {
+                int bitClk = _freq * _bps * (_isTDM ? (double)_tdmChannels : 2.0) /* channels */ * (_isInput && _isOutput ? 4.0 : 2.0) /* edges per clock */;
+                pio_sm_set_clkdiv_int_frac(_pio, _sm, clock_get_hz(clk_sys) / bitClk, 0);
+            } else {
+                float bitClk = _freq * _bps * (_isTDM ? (double)_tdmChannels : 2.0) /* channels */ * (_isInput && _isOutput ? 4.0 : 2.0) /* edges per clock */;
+                pio_sm_set_clkdiv(_pio, _sm, (float)clock_get_hz(clk_sys) / bitClk);
+            }
         }
     }
     return true;
@@ -122,12 +163,10 @@ bool I2S::setFrequency(int newFreq) {
 
 bool I2S::setSysClk(int samplerate) { // optimise sys_clk for desired samplerate
     if (samplerate % 11025 == 0) {
-        set_sys_clock_khz(I2SSYSCLK_44_1, false); // 147.6 unsuccessful - no I2S no USB
-        return true;
+        return set_sys_clock_khz(I2SSYSCLK_44_1, false);
     }
     if (samplerate % 8000 == 0) {
-        set_sys_clock_khz(I2SSYSCLK_8, false);
-        return true;
+        return set_sys_clock_khz(I2SSYSCLK_8, false);
     }
     return false;
 }
@@ -145,7 +184,7 @@ bool I2S::setMCLKmult(int mult) {
 }
 
 bool I2S::setLSBJFormat() {
-    if (_running || !_isOutput) {
+    if (_running || !_isOutput || _isInput) {
         return false;
     }
     _isLSBJ = true;
@@ -169,7 +208,7 @@ bool I2S::setTDMChannels(int channels) {
 }
 
 bool I2S::swapClocks() {
-    if (_running || !_isOutput) {
+    if (_running) {
         return false;
     }
     _swapClocks = true;
@@ -178,18 +217,38 @@ bool I2S::swapClocks() {
 
 void I2S::onTransmit(void(*fn)(void)) {
     if (_isOutput) {
-        _cb = fn;
+        _cbOutput = fn;
         if (_running) {
-            _arb->setCallback(_cb);
+            _arbOutput->setCallback(_cbOutput);
+        }
+    }
+}
+
+void I2S::onTransmit(void(*fn)(void *), void *cbData) {
+    if (_isOutput) {
+        _cbdOutput = fn;
+        _cbdataOutput = cbData;
+        if (_running) {
+            _arbOutput->setCallback(_cbdOutput, _cbdataOutput);
         }
     }
 }
 
 void I2S::onReceive(void(*fn)(void)) {
-    if (!_isOutput) {
-        _cb = fn;
+    if (_isInput) {
+        _cbInput = fn;
         if (_running) {
-            _arb->setCallback(_cb);
+            _arbInput->setCallback(_cbInput);
+        }
+    }
+}
+
+void I2S::onReceive(void(*fn)(void *), void *cbData) {
+    if (_isInput) {
+        _cbdInput = fn;
+        _cbdataInput = cbData;
+        if (_running) {
+            _arbInput->setCallback(_cbdInput, _cbdataInput);
         }
     }
 }
@@ -204,39 +263,129 @@ void I2S::MCLKbegin() {
     pio_sm_set_enabled(_pioMCLK, _smMCLK, true);
 }
 
+pio_program_t *I2S::swap2SideSet(const pio_program_t *in) {
+    int size = (sizeof(*in) + 4) % ~3; // Round up to nearest 32b word for alignment purposes
+    size += in->length * sizeof(uint16_t);
+    uint8_t *mem = (uint8_t *)malloc(size);
+    memcpy(mem, in, sizeof(*in));
+    pio_program_t *out = (pio_program_t *)mem;
+    out->instructions = (uint16_t *)(mem + ((sizeof(*in) + 4) % ~3)); // Place the insn memory right after the struct
+    uint16_t *dest = (uint16_t *)out->instructions;
+    const uint16_t *src = in->instructions;
+    for (int i = 0; i < in->length; i++) {
+        uint16_t insn = src[i];
+        uint16_t a = (insn & (1 << 12)) >> 1; // Move upper sideset bit down
+        uint16_t b = (insn & (1 << 11)) << 1; // Move lower sideset bit up
+        insn &= ~((1 << 12) | (1 << 11));
+        insn |= a | b;
+        dest[i] = insn;
+    }
+    return out;
+}
+
+
 bool I2S::begin() {
+    if (_running) {
+        return false;
+    }
+
     _running = true;
     _hasPeeked = false;
     _isHolding = 0;
-    int off = 0;
-    if (!_swapClocks) {
-        _i2s = new PIOProgram(_isOutput ? (_isTDM ? &pio_tdm_out_program : (_isLSBJ ? &pio_lsbj_out_program : &pio_i2s_out_program)) : &pio_i2s_in_program);
-    } else {
-        _i2s = new PIOProgram(_isOutput ? (_isTDM ? &pio_tdm_out_swap_program : (_isLSBJ ? &pio_lsbj_out_swap_program : &pio_i2s_out_swap_program)) : &pio_i2s_in_swap_program);
+
+    // Determine the proper base program for the PIO
+    // Probably should have started API with an enum/bitmask instead of bunch of flags, but we're here now...
+    const pio_program *pgm;
+    void (*init)(PIO pio, uint sm, uint offset, uint data_in_pin, uint data_out_pin, uint clock_pin_base, uint bits, uint channels);
+    const int _SLAVE = 1 << 0;
+    const int _OUTPUT = 1 << 1;
+    const int _INPUT = 1 << 2;
+    const int _TDM = 1 << 3;
+    const int _LSBJ = 1 << 4;
+    int selector = (_isSlave ? _SLAVE : 0) | (_isOutput ? _OUTPUT : 0) | (_isInput ? _INPUT : 0) | (_isTDM ? _TDM : 0) | (_isLSBJ ? _LSBJ : 0);
+    switch (selector) {
+    case _SLAVE + _OUTPUT:
+        if (_bps > 16) {
+            pgm = &pio_i2s_out_slave_32_program;
+        } else {
+            pgm = &pio_i2s_out_slave_16_program;
+        }
+        init = pio_i2s_out_slave_program_init;
+        break;
+    case _OUTPUT + _INPUT + _TDM:
+        pgm = &pio_tdm_inout_program;
+        init = pio_tdm_inout_program_init;
+        break;
+    case _OUTPUT + _INPUT:
+        pgm = &pio_i2s_inout_program;
+        init = pio_i2s_inout_program_init;
+        break;
+    case _OUTPUT + _TDM:
+        pgm = &pio_tdm_out_program;
+        init = pio_tdm_out_program_init;
+        break;
+    case _OUTPUT + _LSBJ:
+        pgm = &pio_lsbj_out_program;
+        init = pio_lsbj_out_program_init;
+        break;
+    case _OUTPUT:
+        pgm = &pio_i2s_out_program;
+        init = pio_i2s_out_program_init;
+        break;
+    case _SLAVE + _INPUT:
+        pgm = &pio_i2s_in_slave_program;
+        init = pio_i2s_in_slave_program_init;
+        break;
+    case _INPUT:
+        pgm = &pio_i2s_in_program;
+        init = pio_i2s_in_program_init;
+        break;
+    default:
+        // Unsupported combination!
+        _running = false;
+        return false;
     }
-    int minpin = std::min((int)_pinDOUT, (int)_pinBCLK);
-    int maxpin = std::max((int)_pinDOUT, (int)_pinBCLK + 1);
+
+    if (_swapClocks) {
+        // If we swap, we need to save the generated bits and free on ::end
+        _pgm = swap2SideSet(pgm);
+        _i2s = new PIOProgram(_pgm);
+    } else {
+        _i2s = new PIOProgram(pgm);
+    }
+
+    // With the RP2350B there is a GPIO-base offset for PIOs, so need to pass the min/max pins to PIOProgram to set appropriately
+    int minpin, maxpin;
+    if (_isOutput && _isInput) {
+        minpin = std::min(std::min((int)_pinDOUT, (int)_pinDIN), (int)_pinBCLK);
+        maxpin = std::max(std::min((int)_pinDOUT, (int)_pinDIN), (int)_pinBCLK + 1);
+    } else if (_isOutput) {
+        minpin = std::min((int)_pinDOUT, (int)_pinBCLK);
+        maxpin = std::max((int)_pinDOUT, (int)_pinBCLK + 1);
+    } else {
+        minpin = std::min((int)_pinDIN, (int)_pinBCLK);
+        maxpin = std::max((int)_pinDIN, (int)_pinBCLK + 1);
+    }
+
+    int off = 0;
     if (!_i2s->prepare(&_pio, &_sm, &off, minpin, maxpin - minpin + 1)) {
         _running = false;
+        free(_pgm);
         delete _i2s;
         _i2s = nullptr;
         return false;
     }
-    if (_isOutput) {
-        if (_isTDM) {
-            pio_tdm_out_program_init(_pio, _sm, off, _pinDOUT, _pinBCLK, _bps, _swapClocks, _tdmChannels);
-        } else if (_isLSBJ) {
-            pio_lsbj_out_program_init(_pio, _sm, off, _pinDOUT, _pinBCLK, _bps, _swapClocks);
-        } else {
-            pio_i2s_out_program_init(_pio, _sm, off, _pinDOUT, _pinBCLK, _bps, _swapClocks);
-        }
-    } else {
-        pio_i2s_in_program_init(_pio, _sm, off, _pinDOUT, _pinBCLK, _bps, _swapClocks);
-    }
+
+    init(_pio, _sm, off, _pinDIN, _pinDOUT, _pinBCLK, _bps, _tdmChannels);
+
     setFrequency(_freq);
+
+    // Start MCLK if needed
     if (_MCLKenabled) {
         MCLKbegin();
     }
+
+    // Calculate what to send on under/overflow based on the bits
     if (_bps == 8) {
         uint8_t a = _silenceSample & 0xff;
         _silenceSample = (a << 24) | (a << 16) | (a << 8) | a;
@@ -244,25 +393,61 @@ bool I2S::begin() {
         uint16_t a = _silenceSample & 0xffff;
         _silenceSample = (a << 16) | a;
     }
+
+    // Ensure a safe minimum if no buffersize is set
     if (!_bufferWords) {
         _bufferWords = 64 * (_bps == 32 ? 2 : 1);
     }
-    _arb = new AudioBufferManager(_buffers, _bufferWords, _silenceSample, _isOutput ? OUTPUT : INPUT);
-    if (!_arb->begin(pio_get_dreq(_pio, _sm, _isOutput), _isOutput ? &_pio->txf[_sm] : (volatile void*)&_pio->rxf[_sm])) {
-        _running = false;
-        delete _arb;
-        _arb = nullptr;
-        delete _i2s;
-        _i2s = nullptr;
-        return false;
+
+    // Generate the input ARB for DMA to RAM
+    if (_isInput) {
+        _arbInput = new AudioBufferManager(_buffers, _bufferWords, _silenceSample, INPUT);
+        if (!_arbInput->begin(pio_get_dreq(_pio, _sm, false), (volatile void*)&_pio->rxf[_sm])) {
+            _running = false;
+            delete _arbInput;
+            _arbInput = nullptr;
+            free(_pgm);
+            _pgm = nullptr;
+            delete _i2s;
+            _i2s = nullptr;
+            return false;
+        }
+        if (_cbdInput) {
+            _arbInput->setCallback(_cbdInput, _cbdataInput);
+        } else {
+            _arbInput->setCallback(_cbInput);
+        }
     }
-    _arb->setCallback(_cb);
+
+    // Generate the output ARB to dump from RAM to I2S
+    if (_isOutput) {
+        _arbOutput = new AudioBufferManager(_buffers, _bufferWords, _silenceSample, OUTPUT);
+        if (!_arbOutput->begin(pio_get_dreq(_pio, _sm, true), &_pio->txf[_sm])) {
+            _running = false;
+            delete _arbOutput;
+            _arbOutput = nullptr;
+            delete _arbInput;
+            _arbInput = nullptr;
+            free(_pgm);
+            _pgm = nullptr;
+            delete _i2s;
+            _i2s = nullptr;
+            return false;
+        }
+        if (_cbdOutput) {
+            _arbOutput->setCallback(_cbdOutput, _cbdataOutput);
+        } else {
+            _arbOutput->setCallback(_cbOutput);
+        }
+    }
+
+    // Start the ball rolling!
     pio_sm_set_enabled(_pio, _sm, true);
 
     return true;
 }
 
-void I2S::end() {
+bool I2S::end() {
     if (_running) {
         if (_MCLKenabled) {
             pio_sm_set_enabled(_pioMCLK, _smMCLK, false);
@@ -271,20 +456,25 @@ void I2S::end() {
         }
         pio_sm_set_enabled(_pio, _sm, false);
         _running = false;
-        delete _arb;
-        _arb = nullptr;
+        delete _arbOutput;
+        _arbOutput = nullptr;
+        delete _arbInput;
+        _arbInput = nullptr;
+        free(_pgm);
+        _pgm = nullptr;
         delete _i2s;
         _i2s = nullptr;
     }
+    return true;
 }
 
 int I2S::available() {
-    if (!_running) {
+    if (!_running || !_isInput) {
         return 0;
     } else {
-        auto avail = _arb->available();
-        avail *= 4; // 4 samples per 32-bits
-        if (_bps < 24 && !_isOutput) {
+        auto avail = _arbInput->available();
+        avail *= 4; // 4 bytes per 32-bits
+        if (_bps < 24) {
             avail += _isHolding / 8;
         }
         return avail;
@@ -292,7 +482,7 @@ int I2S::available() {
 }
 
 int I2S::read() {
-    if (!_running || _isOutput) {
+    if (!_running || !_isInput) {
         return 0;
     }
 
@@ -328,7 +518,7 @@ int I2S::read() {
 }
 
 int I2S::peek() {
-    if (!_running || _isOutput) {
+    if (!_running || !_isInput) {
         return 0;
     }
     if (!_hasPeeked) {
@@ -340,7 +530,12 @@ int I2S::peek() {
 
 void I2S::flush() {
     if (_running) {
-        _arb->flush();
+        if (_isOutput) {
+            _arbOutput->flush();
+        }
+        if (_isInput) {
+            _arbInput->flush();
+        }
     }
 }
 
@@ -384,7 +579,7 @@ size_t I2S::write(int32_t val, bool sync) {
     if (!_running || !_isOutput) {
         return 0;
     }
-    return _arb->write(val, sync);
+    return _arbOutput->write(val, sync);
 }
 
 size_t I2S::write8(int8_t l, int8_t r) {
@@ -417,14 +612,14 @@ size_t I2S::write32(int32_t l, int32_t r) {
 }
 
 size_t I2S::read(int32_t *val, bool sync) {
-    if (!_running || _isOutput) {
+    if (!_running || !_isInput) {
         return 0;
     }
-    return _arb->read((uint32_t *)val, sync);
+    return _arbInput->read((uint32_t *)val, sync);
 }
 
 bool I2S::read8(int8_t *l, int8_t *r) {
-    if (!_running || _isOutput) {
+    if (!_running || !_isInput) {
         return false;
     }
     if (_isHolding) {
@@ -441,7 +636,7 @@ bool I2S::read8(int8_t *l, int8_t *r) {
 }
 
 bool I2S::read16(int16_t *l, int16_t *r) {
-    if (!_running || _isOutput) {
+    if (!_running || !_isInput) {
         return false;
     }
     int32_t o;
@@ -452,7 +647,7 @@ bool I2S::read16(int16_t *l, int16_t *r) {
 }
 
 bool I2S::read24(int32_t *l, int32_t *r) {
-    if (!_running || _isOutput) {
+    if (!_running || !_isInput) {
         return false;
     }
     read32(l, r);
@@ -463,7 +658,7 @@ bool I2S::read24(int32_t *l, int32_t *r) {
 }
 
 bool I2S::read32(int32_t *l, int32_t *r) {
-    if (!_running || _isOutput) {
+    if (!_running || !_isInput) {
         return false;
     }
     read(l, true);
@@ -471,30 +666,31 @@ bool I2S::read32(int32_t *l, int32_t *r) {
     return true;
 }
 
+size_t I2S::read(uint8_t *buffer, size_t size) {
+    // We can only read 32-bit chunks here
+    if (size & 0x3 || !_running || !_isInput) {
+        return 0;
+    }
+    return 4 * _arbInput->read((uint32_t *)buffer, size / sizeof(uint32_t), false);
+}
+
 size_t I2S::write(const uint8_t *buffer, size_t size) {
     // We can only write 32-bit chunks here
     if (size & 0x3 || !_running || !_isOutput) {
         return 0;
     }
-
-    size_t writtenSize = 0;
-    uint32_t *p = (uint32_t *)buffer;
-    while (size) {
-        if (!_arb->write(*p, false)) {
-            // Blocked, stop write here
-            return writtenSize;
-        } else {
-            p++;
-            size -= 4;
-            writtenSize += 4;
-        }
-    }
-    return writtenSize;
+    return 4 * _arbOutput->write((const uint32_t *)buffer, size / sizeof(uint32_t), false);
 }
 
 int I2S::availableForWrite() {
     if (!_running || !_isOutput) {
         return 0;
+    } else {
+        auto avail = _arbOutput->available();
+        avail *= 4; // 4 bytes per 32-bits
+        if (_bps < 24 && _isInput) {
+            avail += _isHolding / 8;
+        }
+        return avail;
     }
-    return available();
 }

@@ -35,8 +35,8 @@
 #if USE_WIFI
 #include <WiFi.h>
 #elif USE_WIRED
-#include <W5500lwIP.h> // Or W5100lwIP.h or ENC28J60lwIP.h
-Wiznet5500lwIP eth(1 /* chip select */); // or Wiznet5100lwIP or ENC28J60lwIP
+#include <W5500lwIP.h> // or W6100lwIP.h or W5100lwIP.h or ENC28J60lwIP.h
+Wiznet5500lwIP eth(1 /* SPI chip select */); // or Wiznet6100lwIP or Wiznet5100lwIP or ENC28J60lwIP
 #endif
 
 #include <WiFiClient.h>
@@ -97,7 +97,7 @@ void handleNotFound() {
   message += server.args();
   message += "\n";
 
-  for (uint8_t i = 0; i < server.args(); i++) {
+  for (int i = 0; i < server.args(); i++) {
     message += " " + server.argName(i) + ": " + server.arg(i) + "\n";
   }
 

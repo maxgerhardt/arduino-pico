@@ -16,18 +16,33 @@ SPI pinouts can be set **before SPI.begin()** using the following calls:
 Note that the ``CS`` pin can be hardware or software controlled by the sketch.
 When software controlled, the ``setCS()`` call is ignored.
 
-The Arduino `SPI documentation <https://www.arduino.cc/en/reference/SPI>`_ gives
+Passing in ``NOPIN`` to either ``setRX`` or ``setTX`` will disable SPI on that
+interface, making it behave as a unidirectional (output- or input-only SPI interface.
+
+The Arduino `SPI documentation <https://docs.arduino.cc/language-reference/en/functions/communication/SPI/>`_ gives
 a detailed overview of the library, except for the following RP2040-specific
 changes:
 
 * ``SPI.begin(bool hwCS)`` can take an options ``hwCS`` parameter.
-By passing in ``true`` for ``hwCS`` the sketch does not need to worry
-about asserting and deasserting the ``CS`` pin between transactions.
-The default is ``false`` and requires the sketch to handle the CS
-pin itself, as is the standard way in Arduino.
-
+    By passing in ``true`` for ``hwCS`` the sketch does not need to worry
+    about asserting and deasserting the ``CS`` pin between transactions.
+    The default is ``false`` and requires the sketch to handle the CS
+    pin itself, as is the standard way in Arduino.
 * The interrupt calls (``attachInterrupt``, and ``detachInterrpt``) are not implemented.
 
+Software SPI (Master Only)
+==========================
+
+Similar to ``SoftwareSerial``, ``SoftwareSPI`` creates a PIO based SPI interface that
+can be used in the same manner as the hardware SPI devices.  The constructor takes the
+pins desired, which can be any GPIO pins with the rule that if hardware CS is used then
+it must be on pin ``SCK + 1``.  Construct a ``SoftwareSPI`` object in your code as
+follows and use it as needed (i.e. pass it into ``SD.begin(_CS, softwareSPI);``
+
+.. code:: cpp
+
+    #include <SoftwareSPI.h>
+    SoftwareSPI softSPI(_sck, _miso, _mosi); // no HW CS support, any selection of pins can be used
 
 SPI Slave (SPISlave)
 ====================

@@ -68,50 +68,42 @@ static PIOProgram *_getRxProgram(int bits) {
 }
 // ------------------------------------------------------------------------
 
-// TODO - this works, but there must be a faster/better way...
-static int _parity(int bits, int data) {
-    int p = 0;
-    for (int b = 0; b < bits; b++) {
-        p ^= (data & (1 << b)) ? 1 : 0;
-    }
-    return p;
+static int __not_in_flash_func(_parity)(int data) {
+    data ^= data >> 4;
+    data &= 0xf;
+    return (0x6996 >> data) & 1;
 }
 
 // We need to cache generated SerialPIOs so we can add data to them from
 // the shared handler
 static SerialPIO *_pioSP[3][4];
-static void __not_in_flash_func(_fifoIRQ)() {
+void __not_in_flash_func(SerialPIO::_fifoIRQ)() {
     for (int p = 0; p < 3; p++) {
         for (int sm = 0; sm < 4; sm++) {
             SerialPIO *s = _pioSP[p][sm];
             if (s) {
                 s->_handleIRQ();
-                pio_interrupt_clear((p == 0) ? pio0 : pio1, sm);
             }
         }
     }
 }
 
 void __not_in_flash_func(SerialPIO::_handleIRQ)() {
-    if (_rx == NOPIN) {
+    if ((_rx == NOPIN) || (_onCore != get_core_num())) {
         return;
     }
     while (!pio_sm_is_rx_fifo_empty(_rxPIO, _rxSM)) {
         uint32_t decode = _rxPIO->rxf[_rxSM];
-        decode >>= 33 - _rxBits;
-        uint32_t val = 0;
-        for (int b = 0; b < _bits + 1; b++) {
-            val |= (decode & (1 << (b * 2))) ? 1 << b : 0;
-        }
+        uint32_t val = decode >> (32 - _rxBits - 1);
         if (_parity == UART_PARITY_EVEN) {
-            int p = ::_parity(_bits, val);
+            int p = ::_parity(val);
             int r = (val & (1 << _bits)) ? 1 : 0;
             if (p != r) {
                 // TODO - parity error
                 continue;
             }
         } else if (_parity == UART_PARITY_ODD) {
-            int p = ::_parity(_bits, val);
+            int p = ::_parity(val);
             int r = (val & (1 << _bits)) ? 1 : 0;
             if (p == r) {
                 // TODO - parity error
@@ -119,15 +111,7 @@ void __not_in_flash_func(SerialPIO::_handleIRQ)() {
             }
         }
 
-        auto next_writer = _writer + 1;
-        if (next_writer == _fifoSize) {
-            next_writer = 0;
-        }
-        if (next_writer != _reader) {
-            _queue[_writer] = val & ((1 << _bits) -  1);
-            asm volatile("" ::: "memory"); // Ensure the queue is written before the written count advances
-            _writer = next_writer;
-        } else {
+        if (!_queue->write(val & ((1 << _bits) -  1))) {
             _overflow = true;
         }
     }
@@ -137,7 +121,7 @@ SerialPIO::SerialPIO(pin_size_t tx, pin_size_t rx, size_t fifoSize) {
     _tx = tx;
     _rx = rx;
     _fifoSize = fifoSize + 1; // Always one unused entry
-    _queue = new uint8_t[_fifoSize];
+    _queue = new LocklessQueue<uint8_t>(_fifoSize);
     mutex_init(&_mutex);
     _invertTX = false;
     _invertRX = false;
@@ -145,7 +129,7 @@ SerialPIO::SerialPIO(pin_size_t tx, pin_size_t rx, size_t fifoSize) {
 
 SerialPIO::~SerialPIO() {
     end();
-    delete[] _queue;
+    delete _queue;
 }
 
 static int pio_irq_0(PIO p) {
@@ -164,6 +148,7 @@ static int pio_irq_0(PIO p) {
 }
 
 void SerialPIO::begin(unsigned long baud, uint16_t config) {
+    _onCore = get_core_num();
     _overflow = false;
     _baud = baud;
     switch (config & SERIAL_PARITY_MASK) {
@@ -231,10 +216,9 @@ void SerialPIO::begin(unsigned long baud, uint16_t config) {
         pio_sm_set_enabled(_txPIO, _txSM, true);
     }
     if (_rx != NOPIN) {
-        _writer = 0;
-        _reader = 0;
+        _queue->reset();
 
-        _rxBits = 2 * (_bits + _stop + (_parity != UART_PARITY_NONE ? 1 : 0) + 1) - 1;
+        _rxBits = _bits + (_parity != UART_PARITY_NONE ? 1 : 0);
         _rxPgm = _getRxProgram(_rxBits);
         int off;
         if (!_rxPgm->prepare(&_rxPIO, &_rxSM, &off, _rx, 1)) {
@@ -249,7 +233,7 @@ void SerialPIO::begin(unsigned long baud, uint16_t config) {
         pio_sm_clear_fifos(_rxPIO, _rxSM); // Remove any existing data
 
         // Put phase divider into OSR w/o using add'l program memory
-        pio_sm_put_blocking(_rxPIO, _rxSM, clock_get_hz(clk_sys) / (_baud * 2) - 7 /* insns in PIO halfbit loop */);
+        pio_sm_put_blocking(_rxPIO, _rxSM, clock_get_hz(clk_sys) / (_baud * 2) - 3);
         pio_sm_exec(_rxPIO, _rxSM, pio_encode_pull(false, false));
 
         // Join the TX FIFO to the RX one now that we don't need it
@@ -306,11 +290,12 @@ int SerialPIO::peek() {
     if (!_running || !m || (_rx == NOPIN)) {
         return -1;
     }
-    // If there's something in the FIFO now, just peek at it
-    if (_writer != _reader) {
-        return _queue[_reader];
+    uint8_t ret;
+    if (_queue->peek(&ret)) {
+        return ret;
+    } else {
+        return -1;
     }
-    return -1;
 }
 
 int SerialPIO::read() {
@@ -318,15 +303,12 @@ int SerialPIO::read() {
     if (!_running || !m || (_rx == NOPIN)) {
         return -1;
     }
-    if (_writer != _reader) {
-        auto ret = _queue[_reader];
-        asm volatile("" ::: "memory"); // Ensure the value is read before advancing
-        auto next_reader = (_reader + 1) % _fifoSize;
-        asm volatile("" ::: "memory"); // Ensure the reader value is only written once, correctly
-        _reader = next_reader;
+    uint8_t ret;
+    if (_queue->read(&ret)) {
         return ret;
+    } else {
+        return -1;
     }
-    return -1;
 }
 
 bool SerialPIO::overflow() {
@@ -345,7 +327,7 @@ int SerialPIO::available() {
     if (!_running || !m || (_rx == NOPIN)) {
         return 0;
     }
-    return (_writer - _reader) % _fifoSize;
+    return _queue->available();
 }
 
 int SerialPIO::availableForWrite() {
@@ -362,10 +344,10 @@ void SerialPIO::flush() {
         return;
     }
     while (!pio_sm_is_tx_fifo_empty(_txPIO, _txSM)) {
-        delay(1); // Wait for all FIFO to be read
+        /* noop */ // Busy wait for all FIFO to be read
     }
     // Could have 1 byte being transmitted, so wait for bit times
-    delay((1000 * (_txBits + 1)) / _baud);
+    delayMicroseconds((1000000 * (_txBits + 3 /* start + stop + parity */)) / _baud);
 }
 
 size_t SerialPIO::write(uint8_t c) {
@@ -378,10 +360,10 @@ size_t SerialPIO::write(uint8_t c) {
     if (_parity == UART_PARITY_NONE) {
         val |= 7 << _bits; // Set 2 stop bits, the HW will only transmit the required number
     } else if (_parity == UART_PARITY_EVEN) {
-        val |= ::_parity(_bits, c) << _bits;
+        val |= ::_parity(c) << _bits;
         val |= 7 << (_bits + 1);
     } else {
-        val |= (1 ^ ::_parity(_bits, c)) << _bits;
+        val |= (1 ^ ::_parity(c)) << _bits;
         val |= 7 << (_bits + 1);
     }
     val <<= 1;  // Start bit = low

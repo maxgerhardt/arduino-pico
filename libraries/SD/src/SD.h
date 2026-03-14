@@ -36,8 +36,14 @@ public:
         SDFS.setConfig(SDFSConfig(csPin, SPI_HALF_SPEED, spi));
         return SDFS.begin();
     }
+
     bool begin(uint8_t csPin, uint32_t cfg = SPI_HALF_SPEED, HardwareSPI &spi = SPI) {
         SDFS.setConfig(SDFSConfig(csPin, cfg, spi));
+        return SDFS.begin();
+    }
+
+    bool begin(uint8_t clkPin, uint8_t cmdPin, uint8_t dat0Pin) {
+        SDFS.setConfig(SDFSConfig(clkPin, cmdPin, dat0Pin));
         return SDFS.begin();
     }
 
@@ -181,15 +187,15 @@ private:
         }
         const bool append = (mode & O_APPEND) > 0;
 
-        if (read & !write)           {
+        if (read && !write)           {
             return "r";
-        } else if (!read &  write & !append) {
+        } else if (!read && write && !append) {
             return "w+";
-        } else if (!read &  write &  append) {
+        } else if (!read &&  write &&  append) {
             return "a";
-        } else if (read &  write & !append) {
+        } else if (read &&  write && !append) {
             return "w+";    // may be a bug in FS::mode interpretation, "r+" seems proper
-        } else if (read &  write &  append) {
+        } else if (read &&  write &&  append) {
             return "a+";
         } else                                 {
             return "r";
