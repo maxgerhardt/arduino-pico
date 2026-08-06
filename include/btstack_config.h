@@ -53,6 +53,9 @@
 #define HCI_HOST_SCO_PACKET_LEN 120
 #define HCI_HOST_SCO_PACKET_NUM 3
 
+// Use legacy GATT discovery for compatibility with broken devices
+#define ENABLE_GATT_LEGACY_CCC_DISCOVERY
+
 // Link Key DB and LE Device DB using TLV on top of Flash Sector interface
 #define NVM_NUM_DEVICE_DB_ENTRIES 16
 #define NVM_NUM_LINK_KEYS 16
